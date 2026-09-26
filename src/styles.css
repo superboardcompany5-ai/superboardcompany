@@ -172,6 +172,12 @@ th { background: #f1f5f9; }
   height: fit-content;
 }
 
+/* a stack-form/inline-form is flex-wrap, so a direct-child section that
+   needs its own contents to stack vertically (e.g. a list of item-cards)
+   has to claim the full row itself, otherwise it flows inline like any
+   other field and its children wrap unpredictably around neighbors */
+.form-section { width: 100%; }
+
 .stack-form, .inline-form {
   display: flex;
   flex-wrap: wrap;

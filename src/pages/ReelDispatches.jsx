@@ -4,14 +4,12 @@ import { useAuth } from '../hooks/useAuth'
 import { rowsToCsv, downloadCsv, addMonths, todayStr } from '../lib/csv'
 import SearchableSelect from '../components/SearchableSelect'
 
-const emptyForm = {
-  reel_number: '',
+const emptyEditForm = {
   date: todayStr(),
   dispatch_type: 'full',
   sold_form: 'reel',
   remaining_size_cm: '',
   cutting_name: '',
-  job_card_number: '',
   sold_to: '',
   kanta_weight: '',
   remarks: '',
@@ -52,7 +50,7 @@ function cutReportRows(dispatches) {
           sold_to: c.sold_to,
           weight_kg: c.weight_kg,
           cutting_name: d.cutting_name,
-          job_card_number: d.job_card_number,
+          job_card_number: d.reel_job_cards?.job_card_number,
           remarks: c.remarks || d.remarks,
           edited_by_name: d.profiles?.name,
           material_diff: d.reel_dispatch_status?.material_diff,
@@ -77,7 +75,7 @@ function cutReportRows(dispatches) {
         sold_to: d.sold_to,
         weight_kg: d.kanta_weight,
         cutting_name: d.cutting_name,
-        job_card_number: d.job_card_number,
+        job_card_number: d.reel_job_cards?.job_card_number,
         remarks: d.remarks,
         edited_by_name: d.profiles?.name,
         material_diff: d.reel_dispatch_status?.material_diff,
@@ -112,59 +110,89 @@ const REPORT_COLUMNS = [
 ]
 
 const DISPATCH_SELECT =
-  'reel_dispatch_id, reel_number, date, dispatch_type, sold_form, remaining_size_cm, remaining_gross_weight, remaining_kanta_weight, remaining_net_weight, cutting_name, job_card_number, sold_to, kanta_weight, remarks, reel_receipts(quality, gsm), profiles(name), reel_dispatch_cuts(cut_id, cut_size_cm, weight_kg, bundle_count, sheets_per_bundle, extra_sheets, sold_to, remarks)'
+  'reel_dispatch_id, reel_number, job_card_id, date, dispatch_type, sold_form, remaining_size_cm, remaining_gross_weight, remaining_kanta_weight, remaining_net_weight, cutting_name, sold_to, kanta_weight, remarks, reel_receipts(quality, gsm), profiles(name), reel_job_cards(job_card_number), reel_dispatch_cuts(cut_id, cut_size_cm, weight_kg, bundle_count, sheets_per_bundle, extra_sheets, sold_to, remarks)'
+
+const JOB_CARD_SELECT =
+  'job_card_id, job_card_number, reel_number, date, dispatch_type, sold_form, remaining_size_cm, cutting_name, sold_to, remarks, reel_receipts(quality, gsm), reel_job_card_cuts(job_card_cut_id, cut_size_cm, sold_to, remarks)'
+
+const emptyFulfillCutDetail = { weight_kg: '', bundle_count: '', sheets_per_bundle: '', extra_sheets: '' }
 
 export default function ReelDispatches() {
   const { user } = useAuth()
   const [reelStock, setReelStock] = useState([])
+  const [pendingJobCards, setPendingJobCards] = useState([])
   const [recent, setRecent] = useState([])
-  const [form, setForm] = useState(emptyForm)
-  const [cutItems, setCutItems] = useState([{ ...emptyCutItem }])
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+
+  // fulfilling a pending job card (creates a new dispatch)
+  const [selectedJobCardId, setSelectedJobCardId] = useState('')
+  const [fulfillDate, setFulfillDate] = useState(todayStr())
+  const [fulfillKantaWeight, setFulfillKantaWeight] = useState('')
+  const [fulfillCutDetails, setFulfillCutDetails] = useState({})
+
+  // editing an already-fulfilled dispatch — unaffected by the job card split
   const [editingDispatchId, setEditingDispatchId] = useState(null)
   const [editingReelNumber, setEditingReelNumber] = useState(null)
   const [editingBaseline, setEditingBaseline] = useState(null)
+  const [form, setForm] = useState(emptyEditForm)
+  const [cutItems, setCutItems] = useState([{ ...emptyCutItem }])
+
   const [reportFrom, setReportFrom] = useState(todayStr())
   const [reportTo, setReportTo] = useState(todayStr())
   const [reportError, setReportError] = useState(null)
   const [reportBusy, setReportBusy] = useState(false)
 
-  const reelOptions = useMemo(
-    () => reelStock.map((r) => ({
-      value: r.reel_number,
-      label: `${r.reel_number} — ${r.quality} (${r.size_cm} cm, ${r.gross_weight} kg)${r.cutting_name ? ` @ ${r.cutting_name}` : ''}`,
+  const jobCardOptions = useMemo(
+    () => pendingJobCards.map((jc) => ({
+      value: jc.job_card_id,
+      label: `${jc.job_card_number} — ${jc.reel_number} (${jc.reel_receipts?.quality ?? ''}, ${jc.sold_form === 'cutting' ? 'cutting' : `to ${jc.sold_to}`})`,
     })),
-    [reelStock]
+    [pendingJobCards]
   )
 
-  const baseline = useMemo(() => {
-    if (editingDispatchId) return editingBaseline
-    return reelStock.find((r) => r.reel_number === form.reel_number) || null
-  }, [editingDispatchId, editingBaseline, reelStock, form.reel_number])
+  const selectedJobCard = useMemo(
+    () => pendingJobCards.find((jc) => String(jc.job_card_id) === String(selectedJobCardId)) || null,
+    [pendingJobCards, selectedJobCardId]
+  )
 
-  const preview = useMemo(() => {
-    if (!baseline || form.dispatch_type !== 'partial') return null
+  const fulfillBaseline = useMemo(
+    () => (selectedJobCard ? reelStock.find((r) => r.reel_number === selectedJobCard.reel_number) || null : null),
+    [selectedJobCard, reelStock]
+  )
+
+  const fulfillPreview = useMemo(() => {
+    if (!fulfillBaseline || !selectedJobCard || selectedJobCard.dispatch_type !== 'partial') return null
+    const remSize = Number(selectedJobCard.remaining_size_cm)
+    const remGross = round3((fulfillBaseline.gross_weight * remSize) / fulfillBaseline.size_cm)
+    const remKanta = round3((fulfillBaseline.kanta_weight * remSize) / fulfillBaseline.size_cm)
+    const remNet = fulfillBaseline.net_weight != null ? round3((fulfillBaseline.net_weight * remSize) / fulfillBaseline.size_cm) : null
+    return { remGross, remKanta, remNet, dispatchedApproxWeight: round3(fulfillBaseline.gross_weight - remGross) }
+  }, [fulfillBaseline, selectedJobCard])
+
+  const fulfillCutTotal = useMemo(
+    () => Object.values(fulfillCutDetails).reduce((sum, v) => sum + (Number(v.weight_kg) || 0), 0),
+    [fulfillCutDetails]
+  )
+
+  const editPreview = useMemo(() => {
+    if (!editingBaseline || form.dispatch_type !== 'partial') return null
     const remSize = Number(form.remaining_size_cm)
-    if (!form.remaining_size_cm || Number.isNaN(remSize) || remSize < 0 || remSize >= baseline.size_cm) return null
-    const remGross = round3((baseline.gross_weight * remSize) / baseline.size_cm)
-    const remKanta = round3((baseline.kanta_weight * remSize) / baseline.size_cm)
-    const remNet = baseline.net_weight != null ? round3((baseline.net_weight * remSize) / baseline.size_cm) : null
-    return {
-      remGross,
-      remKanta,
-      remNet,
-      dispatchedApproxWeight: round3(baseline.gross_weight - remGross),
-    }
-  }, [baseline, form.dispatch_type, form.remaining_size_cm])
+    if (!form.remaining_size_cm || Number.isNaN(remSize) || remSize < 0 || remSize >= editingBaseline.size_cm) return null
+    const remGross = round3((editingBaseline.gross_weight * remSize) / editingBaseline.size_cm)
+    const remKanta = round3((editingBaseline.kanta_weight * remSize) / editingBaseline.size_cm)
+    const remNet = editingBaseline.net_weight != null ? round3((editingBaseline.net_weight * remSize) / editingBaseline.size_cm) : null
+    return { remGross, remKanta, remNet, dispatchedApproxWeight: round3(editingBaseline.gross_weight - remGross) }
+  }, [editingBaseline, form.dispatch_type, form.remaining_size_cm])
 
-  const cutItemsTotal = useMemo(
+  const editCutItemsTotal = useMemo(
     () => cutItems.reduce((sum, r) => sum + (Number(r.weight_kg) || 0), 0),
     [cutItems]
   )
 
   useEffect(() => {
     loadReelStock()
+    loadPendingJobCards()
     loadRecent()
   }, [])
 
@@ -172,6 +200,16 @@ export default function ReelDispatches() {
     const { data, error } = await supabase.from('reel_stock').select('*').order('reel_number')
     if (error) setError(error.message)
     else setReelStock(data ?? [])
+  }
+
+  async function loadPendingJobCards() {
+    const { data, error } = await supabase
+      .from('reel_job_cards')
+      .select(JOB_CARD_SELECT)
+      .eq('status', 'pending')
+      .order('job_card_number')
+    if (error) setError(error.message)
+    else setPendingJobCards(data ?? [])
   }
 
   async function attachDispatchStatus(dispatches) {
@@ -202,6 +240,27 @@ export default function ReelDispatches() {
     setRecent(await attachDispatchStatus(data))
   }
 
+  function resetFulfillForm() {
+    setSelectedJobCardId('')
+    setFulfillDate(todayStr())
+    setFulfillKantaWeight('')
+    setFulfillCutDetails({})
+  }
+
+  function selectJobCard(jobCardId) {
+    setSelectedJobCardId(jobCardId)
+    setFulfillDate(todayStr())
+    setFulfillKantaWeight('')
+    setFulfillCutDetails({})
+  }
+
+  function updateFulfillCutDetail(jobCardCutId, field, value) {
+    setFulfillCutDetails((details) => ({
+      ...details,
+      [jobCardCutId]: { ...(details[jobCardCutId] || emptyFulfillCutDetail), [field]: value },
+    }))
+  }
+
   function updateField(field, value) {
     setForm((f) => ({ ...f, [field]: value }))
   }
@@ -222,12 +281,13 @@ export default function ReelDispatches() {
     setEditingDispatchId(null)
     setEditingReelNumber(null)
     setEditingBaseline(null)
-    setForm(emptyForm)
+    setForm(emptyEditForm)
     setCutItems([{ ...emptyCutItem }])
   }
 
   async function startEdit(d) {
     setError(null)
+    resetFulfillForm()
     const { data: newer, error: newerError } = await supabase
       .from('reel_dispatches')
       .select('reel_dispatch_id')
@@ -281,13 +341,11 @@ export default function ReelDispatches() {
     setEditingReelNumber(d.reel_number)
     setEditingBaseline(base)
     setForm({
-      reel_number: d.reel_number,
       date: d.date,
       dispatch_type: d.dispatch_type,
       sold_form: d.sold_form,
       remaining_size_cm: d.remaining_size_cm != null ? String(d.remaining_size_cm) : '',
       cutting_name: d.cutting_name || '',
-      job_card_number: d.job_card_number || '',
       sold_to: d.sold_to || '',
       kanta_weight: d.kanta_weight != null ? String(d.kanta_weight) : '',
       remarks: d.remarks || '',
@@ -307,36 +365,147 @@ export default function ReelDispatches() {
     )
   }
 
-  async function handleSubmit(e) {
+  async function handleFulfill(e) {
     e.preventDefault()
     setError(null)
 
-    if (!baseline) {
-      setError('Pick a reel first.')
+    if (!selectedJobCard) {
+      setError('Pick a job card first.')
+      return
+    }
+    if (!fulfillBaseline) {
+      setError('Could not find current stock for this reel.')
       return
     }
 
     const payload = {
-      reel_number: editingDispatchId ? editingReelNumber : form.reel_number,
+      reel_number: selectedJobCard.reel_number,
+      job_card_id: selectedJobCard.job_card_id,
+      date: fulfillDate,
+      dispatch_type: selectedJobCard.dispatch_type,
+      sold_form: selectedJobCard.sold_form,
+      remarks: selectedJobCard.remarks,
+      edited_by: user.id,
+    }
+
+    if (selectedJobCard.dispatch_type === 'partial') {
+      const remSize = Number(selectedJobCard.remaining_size_cm)
+      payload.remaining_size_cm = remSize
+      payload.remaining_gross_weight = round3((fulfillBaseline.gross_weight * remSize) / fulfillBaseline.size_cm)
+      payload.remaining_kanta_weight = round3((fulfillBaseline.kanta_weight * remSize) / fulfillBaseline.size_cm)
+      payload.remaining_net_weight = fulfillBaseline.net_weight != null ? round3((fulfillBaseline.net_weight * remSize) / fulfillBaseline.size_cm) : null
+      payload.cutting_name = selectedJobCard.cutting_name || fulfillBaseline.cutting_name || null
+    } else {
+      payload.remaining_size_cm = null
+      payload.remaining_gross_weight = null
+      payload.remaining_kanta_weight = null
+      payload.remaining_net_weight = null
+      payload.cutting_name = null
+    }
+
+    let cutsToInsert = []
+    if (selectedJobCard.sold_form === 'cutting') {
+      const cuts = selectedJobCard.reel_job_card_cuts ?? []
+      if (cuts.length === 0) {
+        setError('This job card has no cut sizes on it.')
+        return
+      }
+      for (const c of cuts) {
+        const detail = fulfillCutDetails[c.job_card_cut_id]
+        if (!detail?.weight_kg || Number(detail.weight_kg) <= 0) {
+          setError(`Enter the kanta weight for cut ${c.cut_size_cm}.`)
+          return
+        }
+      }
+      cutsToInsert = cuts.map((c) => {
+        const detail = fulfillCutDetails[c.job_card_cut_id] || emptyFulfillCutDetail
+        return {
+          cut_size_cm: c.cut_size_cm,
+          weight_kg: Number(detail.weight_kg),
+          bundle_count: detail.bundle_count ? Number(detail.bundle_count) : null,
+          sheets_per_bundle: detail.sheets_per_bundle ? Number(detail.sheets_per_bundle) : null,
+          extra_sheets: detail.extra_sheets ? Number(detail.extra_sheets) : null,
+          sold_to: c.sold_to,
+          remarks: c.remarks,
+          edited_by: user.id,
+        }
+      })
+      payload.sold_to = null
+      payload.kanta_weight = null
+    } else {
+      if (!fulfillKantaWeight) {
+        setError('Enter the kanta weight.')
+        return
+      }
+      payload.sold_to = selectedJobCard.sold_to
+      payload.kanta_weight = Number(fulfillKantaWeight)
+    }
+
+    setSubmitting(true)
+
+    const { data, error } = await supabase.from('reel_dispatches').insert(payload).select().single()
+    if (error) {
+      setSubmitting(false)
+      setError(error.message)
+      return
+    }
+
+    if (selectedJobCard.sold_form === 'cutting') {
+      const { error: cutsError } = await supabase.from('reel_dispatch_cuts').insert(
+        cutsToInsert.map((c) => ({ ...c, reel_dispatch_id: data.reel_dispatch_id }))
+      )
+      if (cutsError) {
+        setSubmitting(false)
+        setError(cutsError.message)
+        return
+      }
+    }
+
+    const { error: jcError } = await supabase
+      .from('reel_job_cards')
+      .update({ status: 'dispatched' })
+      .eq('job_card_id', selectedJobCard.job_card_id)
+    if (jcError) {
+      setSubmitting(false)
+      setError(jcError.message)
+      return
+    }
+
+    setSubmitting(false)
+    resetFulfillForm()
+    loadReelStock()
+    loadPendingJobCards()
+    loadRecent()
+  }
+
+  async function handleUpdate(e) {
+    e.preventDefault()
+    setError(null)
+
+    if (!editingBaseline) {
+      setError('Missing baseline for this reel.')
+      return
+    }
+
+    const payload = {
       date: form.date,
       dispatch_type: form.dispatch_type,
       sold_form: form.sold_form,
-      job_card_number: form.sold_form === 'cutting' ? (form.job_card_number || null) : null,
       remarks: form.remarks || null,
       edited_by: user.id,
     }
 
     if (form.dispatch_type === 'partial') {
       const remSize = Number(form.remaining_size_cm)
-      if (!form.remaining_size_cm || Number.isNaN(remSize) || remSize < 0 || remSize >= baseline.size_cm) {
-        setError(`Remaining size must be between 0 and ${baseline.size_cm} cm (less than the current size — otherwise nothing was cut).`)
+      if (!form.remaining_size_cm || Number.isNaN(remSize) || remSize < 0 || remSize >= editingBaseline.size_cm) {
+        setError(`Remaining size must be between 0 and ${editingBaseline.size_cm} cm (less than the current size — otherwise nothing was cut).`)
         return
       }
       payload.remaining_size_cm = remSize
-      payload.remaining_gross_weight = round3((baseline.gross_weight * remSize) / baseline.size_cm)
-      payload.remaining_kanta_weight = round3((baseline.kanta_weight * remSize) / baseline.size_cm)
-      payload.remaining_net_weight = baseline.net_weight != null ? round3((baseline.net_weight * remSize) / baseline.size_cm) : null
-      payload.cutting_name = form.cutting_name || baseline.cutting_name || null
+      payload.remaining_gross_weight = round3((editingBaseline.gross_weight * remSize) / editingBaseline.size_cm)
+      payload.remaining_kanta_weight = round3((editingBaseline.kanta_weight * remSize) / editingBaseline.size_cm)
+      payload.remaining_net_weight = editingBaseline.net_weight != null ? round3((editingBaseline.net_weight * remSize) / editingBaseline.size_cm) : null
+      payload.cutting_name = form.cutting_name || editingBaseline.cutting_name || null
     } else {
       payload.remaining_size_cm = null
       payload.remaining_gross_weight = null
@@ -347,11 +516,17 @@ export default function ReelDispatches() {
 
     let validCuts = []
     if (form.sold_form === 'cutting') {
-      validCuts = cutItems.filter((r) => r.cut_size_cm.trim() && r.weight_kg && r.sold_to.trim())
-      if (validCuts.length === 0) {
+      const filledCuts = cutItems.filter((r) => r.cut_size_cm.trim() || r.weight_kg || r.sold_to.trim())
+      if (filledCuts.length === 0) {
         setError('Add at least one cut size with a weight and a client sold to.')
         return
       }
+      const incomplete = filledCuts.find((r) => !r.cut_size_cm.trim() || !r.weight_kg || !r.sold_to.trim())
+      if (incomplete) {
+        setError('Each cut size needs a size, a kanta weight, and who it was sold to.')
+        return
+      }
+      validCuts = filledCuts
       payload.sold_to = null
       payload.kanta_weight = null
     } else {
@@ -365,34 +540,23 @@ export default function ReelDispatches() {
 
     setSubmitting(true)
 
-    let dispatchId = editingDispatchId
-    if (editingDispatchId) {
-      const { error } = await supabase.from('reel_dispatches').update(payload).eq('reel_dispatch_id', editingDispatchId)
-      if (error) {
-        setSubmitting(false)
-        setError(error.message)
-        return
-      }
-      const { error: deleteError } = await supabase.from('reel_dispatch_cuts').delete().eq('reel_dispatch_id', editingDispatchId)
-      if (deleteError) {
-        setSubmitting(false)
-        setError(deleteError.message)
-        return
-      }
-    } else {
-      const { data, error } = await supabase.from('reel_dispatches').insert(payload).select().single()
-      if (error) {
-        setSubmitting(false)
-        setError(error.message)
-        return
-      }
-      dispatchId = data.reel_dispatch_id
+    const { error } = await supabase.from('reel_dispatches').update(payload).eq('reel_dispatch_id', editingDispatchId)
+    if (error) {
+      setSubmitting(false)
+      setError(error.message)
+      return
+    }
+    const { error: deleteError } = await supabase.from('reel_dispatch_cuts').delete().eq('reel_dispatch_id', editingDispatchId)
+    if (deleteError) {
+      setSubmitting(false)
+      setError(deleteError.message)
+      return
     }
 
     if (form.sold_form === 'cutting') {
       const { error: cutsError } = await supabase.from('reel_dispatch_cuts').insert(
         validCuts.map((r) => ({
-          reel_dispatch_id: dispatchId,
+          reel_dispatch_id: editingDispatchId,
           cut_size_cm: r.cut_size_cm.trim(),
           weight_kg: Number(r.weight_kg),
           bundle_count: r.bundle_count ? Number(r.bundle_count) : null,
@@ -465,116 +629,164 @@ export default function ReelDispatches() {
 
   return (
     <div className="page">
-      <h1>Reel Dispatches (outgoing reel stock)</h1>
+      <h1>Reel Dispatches (fulfilling job cards)</h1>
 
-      <form className="stack-form" onSubmit={handleSubmit}>
-        {editingDispatchId ? (
+      {editingDispatchId ? (
+        <form className="stack-form" onSubmit={handleUpdate}>
           <label>
             Reel Number
             <input value={editingReelNumber} disabled />
           </label>
-        ) : (
+
+          {editingBaseline && (
+            <p className="hint">
+              Currently: {editingBaseline.size_cm} cm, gross {editingBaseline.gross_weight} kg, kanta {editingBaseline.kanta_weight} kg
+              {editingBaseline.net_weight != null ? `, net ${editingBaseline.net_weight} kg` : ''}
+              {editingBaseline.cutting_name ? ` @ ${editingBaseline.cutting_name}` : ''}
+            </p>
+          )}
+
           <label>
-            Reel Number
+            Date
+            <input type="date" value={form.date} onChange={(e) => updateField('date', e.target.value)} required />
+          </label>
+
+          <label>
+            Full or Partial
+            <select value={form.dispatch_type} onChange={(e) => updateField('dispatch_type', e.target.value)}>
+              <option value="full">Full reel sold</option>
+              <option value="partial">Partial — some cut off, rest stays in stock</option>
+            </select>
+          </label>
+
+          <label>
+            Sold As
+            <select value={form.sold_form} onChange={(e) => updateField('sold_form', e.target.value)}>
+              <option value="reel">Reel (sold as it is)</option>
+              <option value="cutting">Cutting (cut into sheets)</option>
+            </select>
+          </label>
+
+          {form.dispatch_type === 'partial' && (
+            <>
+              <label>
+                Remaining Size (cm) — what stays on the reel
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={form.remaining_size_cm}
+                  onChange={(e) => updateField('remaining_size_cm', e.target.value)}
+                  required
+                />
+              </label>
+              <label>
+                Cutting / Location (for what remains)
+                <input value={form.cutting_name} onChange={(e) => updateField('cutting_name', e.target.value)} />
+              </label>
+            </>
+          )}
+
+          {editPreview && (
+            <p className="hint">
+              Remaining on reel: {editPreview.remGross} kg gross / {editPreview.remKanta} kg kanta
+              {editPreview.remNet != null ? ` / ${editPreview.remNet} kg net` : ''}.{' '}
+              Approx. weight being dispatched now: {editPreview.dispatchedApproxWeight} kg.
+            </p>
+          )}
+
+          {form.sold_form === 'reel' ? (
+            <>
+              <label>
+                Sold To
+                <input value={form.sold_to} onChange={(e) => updateField('sold_to', e.target.value)} required />
+              </label>
+              <label>
+                Kanta Weight of sold reel (kg)
+                <input type="number" min="0.01" step="any" value={form.kanta_weight} onChange={(e) => updateField('kanta_weight', e.target.value)} required />
+              </label>
+            </>
+          ) : null}
+
+          <label>
+            Remarks
+            <input value={form.remarks} onChange={(e) => updateField('remarks', e.target.value)} />
+          </label>
+
+          <button type="submit" disabled={submitting}>{submitting ? 'Saving…' : 'Update dispatch'}</button>
+          <button type="button" onClick={cancelEdit}>Cancel</button>
+        </form>
+      ) : (
+        <form className="stack-form" onSubmit={handleFulfill}>
+          <label>
+            Job Card
             <SearchableSelect
-              options={reelOptions}
-              value={form.reel_number}
-              onChange={(v) => updateField('reel_number', v)}
-              placeholder="Type to search…"
+              options={jobCardOptions}
+              value={selectedJobCardId}
+              onChange={selectJobCard}
+              placeholder="Type to search a pending job card…"
               required
             />
           </label>
-        )}
 
-        {baseline && (
-          <p className="hint">
-            Currently: {baseline.size_cm} cm, gross {baseline.gross_weight} kg, kanta {baseline.kanta_weight} kg
-            {baseline.net_weight != null ? `, net ${baseline.net_weight} kg` : ''}
-            {baseline.cutting_name ? ` @ ${baseline.cutting_name}` : ''}
-          </p>
-        )}
+          {jobCardOptions.length === 0 && (
+            <p className="hint">No pending job cards. Create one on the Reel Job Cards page first.</p>
+          )}
 
-        <label>
-          Date
-          <input type="date" value={form.date} onChange={(e) => updateField('date', e.target.value)} required />
-        </label>
+          {selectedJobCard && (
+            <>
+              {fulfillBaseline && (
+                <p className="hint">
+                  Currently: {fulfillBaseline.size_cm} cm, gross {fulfillBaseline.gross_weight} kg, kanta {fulfillBaseline.kanta_weight} kg
+                  {fulfillBaseline.net_weight != null ? `, net ${fulfillBaseline.net_weight} kg` : ''}
+                  {fulfillBaseline.cutting_name ? ` @ ${fulfillBaseline.cutting_name}` : ''}
+                </p>
+              )}
+              <p className="hint">
+                {selectedJobCard.dispatch_type === 'full' ? 'Full reel sold' : 'Partial'}
+                {' · '}{selectedJobCard.sold_form === 'cutting' ? 'Cutting' : `Sold to ${selectedJobCard.sold_to}`}
+                {selectedJobCard.dispatch_type === 'partial'
+                  ? ` · remaining ${selectedJobCard.remaining_size_cm} cm${selectedJobCard.cutting_name ? ` @ ${selectedJobCard.cutting_name}` : ''}`
+                  : ''}
+              </p>
+              {selectedJobCard.remarks && <p className="hint">Job card remarks: {selectedJobCard.remarks}</p>}
 
-        <label>
-          Full or Partial
-          <select value={form.dispatch_type} onChange={(e) => updateField('dispatch_type', e.target.value)}>
-            <option value="full">Full reel sold</option>
-            <option value="partial">Partial — some cut off, rest stays in stock</option>
-          </select>
-        </label>
+              {fulfillPreview && (
+                <p className="hint">
+                  Remaining on reel: {fulfillPreview.remGross} kg gross / {fulfillPreview.remKanta} kg kanta
+                  {fulfillPreview.remNet != null ? ` / ${fulfillPreview.remNet} kg net` : ''}.{' '}
+                  Approx. weight being dispatched now: {fulfillPreview.dispatchedApproxWeight} kg.
+                </p>
+              )}
 
-        <label>
-          Sold As
-          <select value={form.sold_form} onChange={(e) => updateField('sold_form', e.target.value)}>
-            <option value="reel">Reel (sold as it is)</option>
-            <option value="cutting">Cutting (cut into sheets)</option>
-          </select>
-        </label>
+              <label>
+                Date
+                <input type="date" value={fulfillDate} onChange={(e) => setFulfillDate(e.target.value)} required />
+              </label>
 
-        {form.sold_form === 'cutting' && (
-          <label>
-            Job Card Number
-            <input value={form.job_card_number} onChange={(e) => updateField('job_card_number', e.target.value)} />
-          </label>
-        )}
+              {selectedJobCard.sold_form === 'reel' && (
+                <label>
+                  Kanta Weight of sold reel (kg)
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={fulfillKantaWeight}
+                    onChange={(e) => setFulfillKantaWeight(e.target.value)}
+                    required
+                  />
+                </label>
+              )}
+            </>
+          )}
 
-        {form.dispatch_type === 'partial' && (
-          <>
-            <label>
-              Remaining Size (cm) — what stays on the reel
-              <input
-                type="number"
-                min="0"
-                step="any"
-                value={form.remaining_size_cm}
-                onChange={(e) => updateField('remaining_size_cm', e.target.value)}
-                required
-              />
-            </label>
-            <label>
-              Cutting / Location (for what remains)
-              <input value={form.cutting_name} onChange={(e) => updateField('cutting_name', e.target.value)} />
-            </label>
-          </>
-        )}
+          <button type="submit" disabled={submitting || !selectedJobCard}>
+            {submitting ? 'Saving…' : 'Record reel dispatch'}
+          </button>
+        </form>
+      )}
 
-        {preview && (
-          <p className="hint">
-            Remaining on reel: {preview.remGross} kg gross / {preview.remKanta} kg kanta
-            {preview.remNet != null ? ` / ${preview.remNet} kg net` : ''}.{' '}
-            Approx. weight being dispatched now: {preview.dispatchedApproxWeight} kg.
-          </p>
-        )}
-
-        {form.sold_form === 'reel' ? (
-          <>
-            <label>
-              Sold To
-              <input value={form.sold_to} onChange={(e) => updateField('sold_to', e.target.value)} required />
-            </label>
-            <label>
-              Kanta Weight of sold reel (kg)
-              <input type="number" min="0.01" step="any" value={form.kanta_weight} onChange={(e) => updateField('kanta_weight', e.target.value)} required />
-            </label>
-          </>
-        ) : null}
-
-        <label>
-          Remarks
-          <input value={form.remarks} onChange={(e) => updateField('remarks', e.target.value)} />
-        </label>
-
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Saving…' : editingDispatchId ? 'Update dispatch' : 'Record reel dispatch'}
-        </button>
-        {editingDispatchId && <button type="button" onClick={cancelEdit}>Cancel</button>}
-      </form>
-
-      {form.sold_form === 'cutting' && (
+      {editingDispatchId && form.sold_form === 'cutting' && (
         <>
           <h2>Cut sizes sold</h2>
           {cutItems.map((row, i) => (
@@ -617,7 +829,68 @@ export default function ReelDispatches() {
             </div>
           ))}
           <button type="button" onClick={addCutItem}>Add cut size</button>
-          {cutItemsTotal > 0 && <p className="hint">Total kanta weight across cut sizes: {round3(cutItemsTotal)} kg</p>}
+          {editCutItemsTotal > 0 && <p className="hint">Total kanta weight across cut sizes: {round3(editCutItemsTotal)} kg</p>}
+        </>
+      )}
+
+      {!editingDispatchId && selectedJobCard?.sold_form === 'cutting' && (
+        <>
+          <h2>Cut sizes on this job card</h2>
+          {(selectedJobCard.reel_job_card_cuts ?? []).map((c) => {
+            const detail = fulfillCutDetails[c.job_card_cut_id] || emptyFulfillCutDetail
+            return (
+              <div className="item-card" key={c.job_card_cut_id}>
+                <span className="hint">
+                  {c.cut_size_cm} — sold to {c.sold_to}
+                  {c.remarks ? ` — ${c.remarks}` : ''}
+                </span>
+                <label>
+                  Kanta Weight (kg)
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={detail.weight_kg}
+                    onChange={(e) => updateFulfillCutDetail(c.job_card_cut_id, 'weight_kg', e.target.value)}
+                  />
+                </label>
+                <label>
+                  Bundles
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={detail.bundle_count}
+                    onChange={(e) => updateFulfillCutDetail(c.job_card_cut_id, 'bundle_count', e.target.value)}
+                  />
+                </label>
+                <label>
+                  Sheets/Bundle
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={detail.sheets_per_bundle}
+                    onChange={(e) => updateFulfillCutDetail(c.job_card_cut_id, 'sheets_per_bundle', e.target.value)}
+                  />
+                </label>
+                <label>
+                  Extra Sheets (loose, not a full bundle)
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={detail.extra_sheets}
+                    onChange={(e) => updateFulfillCutDetail(c.job_card_cut_id, 'extra_sheets', e.target.value)}
+                  />
+                </label>
+                {totalSheets(detail.bundle_count, detail.sheets_per_bundle, detail.extra_sheets) != null && (
+                  <span className="hint">Total sheets: {totalSheets(detail.bundle_count, detail.sheets_per_bundle, detail.extra_sheets)}</span>
+                )}
+              </div>
+            )
+          })}
+          {fulfillCutTotal > 0 && <p className="hint">Total kanta weight across cut sizes: {round3(fulfillCutTotal)} kg</p>}
         </>
       )}
 
@@ -654,7 +927,7 @@ export default function ReelDispatches() {
                 <td>{d.date}</td>
                 <td>{d.dispatch_type === 'full' ? 'Full' : 'Partial'}</td>
                 <td>{d.sold_form === 'cutting' ? 'Cutting' : 'Reel'}</td>
-                <td>{d.job_card_number}</td>
+                <td>{d.reel_job_cards?.job_card_number}</td>
                 <td>{c ? c.cut_size_cm : '—'}</td>
                 <td>{c ? c.bundle_count ?? '—' : ''}</td>
                 <td>{c ? c.sheets_per_bundle ?? '—' : ''}</td>

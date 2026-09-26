@@ -8,6 +8,7 @@ export default function NavBar() {
     <nav className="navbar">
       <NavLink to="/" end>Reel Stock</NavLink>
       <NavLink to="/reel-receipts">Reel Receipts</NavLink>
+      <NavLink to="/reel-job-cards">Reel Job Cards</NavLink>
       <NavLink to="/reel-dispatches">Reel Dispatches</NavLink>
       <button className="link-button" onClick={signOut}>Log out</button>
     </nav>
